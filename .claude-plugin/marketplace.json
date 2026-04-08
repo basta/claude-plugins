@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "basta-plugins",
+  "description": "Personal Claude Code plugin marketplace",
+  "owner": {
+    "name": "basta"
+  },
+  "plugins": [
+    {
+      "name": "metacentrum",
+      "description": "MetaCentrum HPC grid helper — submit PBS jobs, check status, transfer data, mount storage via SSHFS, search docs",
+      "source": "./plugins/metacentrum",
+      "category": "productivity"
+    }
+  ]
+}
