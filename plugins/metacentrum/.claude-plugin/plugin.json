@@ -1,0 +1,8 @@
+{
+  "name": "metacentrum",
+  "description": "Helper for MetaCentrum HPC grid — submit PBS jobs, check status, transfer data, mount storage via SSHFS, search docs",
+  "author": {
+    "name": "basta",
+    "email": ""
+  }
+}
