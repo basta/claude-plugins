@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# pbs-local -- run a PBS job script on this machine, with a fake PBS around it.
+#
+# Catches the bugs that actually waste queue time: wrong paths, a copy-back that
+# never fires, a trap that wipes scratch too early, a venv that is not where the
+# script thinks, an array index that maps to nothing. It does NOT tell you
+# whether the code is fast enough or fits in the requested memory.
+#
+#   pbs-local job.pbs.sh                    # run it
+#   pbs-local --dry-run job.pbs.sh          # just show the parsed directives + env
+#   pbs-local -J 1-4 array.pbs.sh           # four subjobs, sequentially
+#   pbs-local --walltime 60 job.pbs.sh      # SIGTERM at 60 s, SIGKILL 10 s later,
+#                                           #   exactly like a real walltime kill
+#   pbs-local --ncpus 2 job.pbs.sh          # override NCPUS to exercise the thread guard
+#
+# Scratch is a real temp dir, removed on exit unless --keep-scratch.
+
+set -uo pipefail
+
+DRY=0; KEEP=0; WALLTIME=""; NCPUS_OVERRIDE=""; ARRAY=""
+SCRIPT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)      DRY=1; shift ;;
+    --keep-scratch) KEEP=1; shift ;;
+    --walltime)     WALLTIME="$2"; shift 2 ;;
+    --ncpus)        NCPUS_OVERRIDE="$2"; shift 2 ;;
+    -J)             ARRAY="$2"; shift 2 ;;
+    -h|--help)      sed -n '2,20p' "$0"; exit 0 ;;
+    -*)             echo "pbs-local: unknown option $1" >&2; exit 2 ;;
+    *)              SCRIPT="$1"; shift; break ;;
+  esac
+done
+
+[ -n "$SCRIPT" ] && [ -f "$SCRIPT" ] || { echo "usage: pbs-local [opts] <job.pbs.sh>" >&2; exit 2; }
+
+# ------------------------------------------------------- parse #PBS lines ----
+
+directives="$(grep -E '^#PBS ' "$SCRIPT" || true)"
+sel="$(printf '%s\n' "$directives" | grep -o 'select=[^ ]*' | head -1)"
+
+pbs_ncpus="$(printf '%s' "$sel" | grep -o 'ncpus=[0-9]*' | cut -d= -f2 | head -1)"
+pbs_mem="$(printf '%s'   "$sel" | grep -o 'mem=[^:]*'    | cut -d= -f2 | head -1)"
+pbs_scr="$(printf '%s'   "$sel" | grep -o 'scratch_[a-z]*=[^:]*' | head -1)"
+pbs_gpu="$(printf '%s'   "$sel" | grep -o 'ngpus=[0-9]*' | cut -d= -f2 | head -1)"
+pbs_name="$(printf '%s\n' "$directives" | grep -o '\-N [^ ]*' | awk '{print $2}' | head -1)"
+pbs_wall="$(printf '%s\n' "$directives" | grep -o 'walltime=[^ ]*' | cut -d= -f2 | head -1)"
+[ -n "${ARRAY:-}" ] || ARRAY="$(printf '%s\n' "$directives" | grep -o '\-J [^ ]*' | awk '{print $2}' | head -1)"
+
+: "${pbs_name:=localjob}"
+: "${pbs_ncpus:=1}"
+
+# Warn about the things PBS would reject or punish, before wasting a submission.
+warn() { printf '  ! %s\n' "$*"; }
+echo "== $SCRIPT"
+printf '  name=%s ncpus=%s mem=%s %s ngpus=%s walltime=%s\n' \
+  "$pbs_name" "$pbs_ncpus" "${pbs_mem:-<unset>}" "${pbs_scr:-<no scratch!>}" \
+  "${pbs_gpu:-0}" "${pbs_wall:-<unset>}"
+[ -n "$pbs_scr"  ] || warn "no scratch_* requested — there is NO default size; \$SCRATCHDIR will be a token dir on the cluster"
+[ -n "$pbs_mem"  ] || warn "no mem requested — PBS defaults to 400mb and kills with -27"
+[ -n "$pbs_wall" ] || warn "no walltime — defaults to 24:00:00"
+printf '%s\n' "$directives" | grep -q '\-q ' && warn "-q names a queue; PBS routes by walltime+ngpus on its own, and resources_min will often reject you"
+grep -q 'OMP_NUM_THREADS' "$SCRIPT" || warn "OMP_NUM_THREADS is never set — torch/numpy will grab every core on the node and PBS kills the job with -25"
+grep -qE '^[[:space:]]*trap[^#]*clean_scratch[^#]*\bEXIT\b' "$SCRIPT" && warn "trap ... EXIT fires on early failure too, wiping scratch before the copy-back. Prefer TERM."
+grep -qE '^[[:space:]]*\(?[[:space:]]*while[[:space:]]+sleep' "$SCRIPT" && warn "a 'while sleep N' background loop leaves an orphaned sleep when killed; it holds the job stdout open and parks the job in state E"
+
+[ "$DRY" -eq 1 ] || true
+
+# ----------------------------------------------------------- fake the PBS ----
+
+STUBS="$(mktemp -d)"
+SCRATCH_ROOT="$(mktemp -d)"
+cleanup() { [ "$KEEP" -eq 1 ] || rm -rf "$STUBS" "$SCRATCH_ROOT"; }
+trap cleanup EXIT
+
+cat > "$STUBS/clean_scratch" <<'EOF'
+#!/bin/sh
+[ -n "$SCRATCHDIR" ] && rm -rf "$SCRATCHDIR"/* "$SCRATCHDIR"/.[!.]* 2>/dev/null
+echo "[pbs-local] clean_scratch: emptied $SCRATCHDIR"
+EOF
+cat > "$STUBS/module" <<'EOF'
+#!/bin/sh
+echo "[pbs-local] module $* (no-op)" >&2
+EOF
+cat > "$STUBS/go_to_scratch" <<'EOF'
+#!/bin/sh
+echo "[pbs-local] go_to_scratch $* (no-op)" >&2
+EOF
+cat > "$STUBS/check-local-quota" <<'EOF'
+#!/bin/sh
+echo "[pbs-local] check-local-quota (no-op)" >&2
+EOF
+chmod +x "$STUBS"/*
+
+run_one() {
+  local idx="${1:-}"
+  local jobid="local$$${idx:+[$idx]}"
+  local scratch="$SCRATCH_ROOT/job_${jobid//[^A-Za-z0-9_]/_}"
+  mkdir -p "$scratch"
+
+  local ncpus="${NCPUS_OVERRIDE:-$pbs_ncpus}"
+
+  echo
+  echo "-- running${idx:+ subjob $idx} as $jobid (ncpus=$ncpus, scratch=$scratch)"
+  [ "$DRY" -eq 1 ] && { echo "   (dry run — not executing)"; return 0; }
+
+  local env_args=(
+    "PATH=$STUBS:$PATH"
+    "SCRATCHDIR=$scratch"
+    "SCRATCH_TYPE=local"
+    "SCRATCH_VOLUME=${pbs_scr#*=}"
+    "PBS_O_WORKDIR=$PWD"
+    "PBS_JOBID=$jobid"
+    "PBS_JOBNAME=$pbs_name"
+    "NCPUS=$ncpus"
+    "PBS_LOCAL=1"
+  )
+  [ -n "$idx" ] && env_args+=("PBS_ARRAY_INDEX=$idx" "PBS_ARRAY_ID=local$$[]")
+
+  # Give the job its own PROCESS GROUP (`set -m`), so we can signal exactly the
+  # job the way PBS does, and can spot background processes it forgot to reap.
+  #
+  # Do NOT use `setsid` + session ids here: setsid forks when it is already a
+  # process-group leader, so $! is setsid's pid, it exits immediately, and
+  # reading a session id back races into returning *the caller's own session*.
+  # Signalling that kills the user's shell and anything else it started.
+  local rc=0 pid pgid="" killer=""
+  set -m
+  env "${env_args[@]}" bash "$SCRIPT" &
+  pid=$!
+  set +m
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  # Only ever signal a group we have positively identified as this job's: the
+  # leader must be the child itself.
+  case "$pgid" in
+    ''|0|1) pgid="" ;;
+    "$pid") ;;
+    *)      pgid="" ;;
+  esac
+
+  if [ -n "$WALLTIME" ]; then
+    # The real kill: SIGTERM to the whole job, SIGKILL 10 s later. That 10 s is
+    # the entire window your trap gets — which is why a big copy-back in a trap
+    # loses data.
+    ( sleep "$WALLTIME"
+      if [ -n "$pgid" ]; then kill -TERM "-$pgid" 2>/dev/null; else kill -TERM "$pid" 2>/dev/null; fi
+      echo "[pbs-local] SIGTERM at ${WALLTIME}s (simulated walltime kill)" >&2
+      sleep 10
+      if [ -n "$pgid" ]; then kill -KILL "-$pgid" 2>/dev/null; else kill -KILL "$pid" 2>/dev/null; fi
+      echo "[pbs-local] SIGKILL 10 s later" >&2 ) &
+    killer=$!
+  fi
+
+  wait "$pid"; rc=$?
+  [ -n "$killer" ] && kill "$killer" 2>/dev/null
+
+  # Strays: anything still alive in the job's own process group. Reported and
+  # cleaned only when the group was positively identified above; otherwise we
+  # say nothing rather than risk signalling an unrelated group.
+  if [ -n "$pgid" ]; then
+    local strays
+    strays="$(ps -eo pid=,pgid=,args= 2>/dev/null | awk -v g="$pgid" '$2==g {print}' || true)"
+    if [ -n "$strays" ]; then
+      warn "the job returned but left processes alive in its process group:"
+      printf '%s\n' "$strays" | sed 's/^/       /'
+      warn "on the cluster PBS holds such a job in state E, burning walltime, until they exit"
+      kill -TERM "-$pgid" 2>/dev/null
+      sleep 1
+      kill -KILL "-$pgid" 2>/dev/null
+    fi
+  fi
+
+  echo "-- exit $rc${idx:+ (subjob $idx)}"
+  [ "$KEEP" -eq 1 ] && echo "   scratch kept: $scratch"
+  return $rc
+}
+
+# ------------------------------------------------------------------- run -----
+
+overall=0
+if [ -n "$ARRAY" ]; then
+  start="${ARRAY%%-*}"; rest="${ARRAY#*-}"
+  end="${rest%%:*}";    step=1
+  case "$rest" in *:*) step="${rest#*:}";; esac
+  for ((i=start; i<=end; i+=step)); do
+    run_one "$i" || overall=$?
+  done
+else
+  run_one || overall=$?
+fi
+
+echo
+echo "== done (worst exit $overall)"
+exit $overall

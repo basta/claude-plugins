@@ -1,0 +1,7 @@
+{
+  "name": "run-on-metacentrum",
+  "description": "Run a whole compute project on MetaCentrum (CESNET PBS grid): the mc helper, a local fake-PBS for testing job scripts, and verified job templates for sweeps, arrays and GPU/vLLM runs",
+  "author": {
+    "name": "basta"
+  }
+}

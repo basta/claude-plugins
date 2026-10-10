@@ -11,6 +11,12 @@
       "description": "MetaCentrum HPC grid helper — submit PBS jobs, check status, transfer data, mount storage via SSHFS, search docs",
       "source": "./plugins/metacentrum",
       "category": "productivity"
+    },
+    {
+      "name": "run-on-metacentrum",
+      "description": "Run a whole compute project on MetaCentrum: mc helper, local fake-PBS for testing job scripts, verified templates for sweeps, arrays and GPU/vLLM runs",
+      "source": "./plugins/run-on-metacentrum",
+      "category": "productivity"
     }
   ]
 }

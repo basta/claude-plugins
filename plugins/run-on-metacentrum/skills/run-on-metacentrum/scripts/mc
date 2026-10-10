@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# mc -- drive a project on MetaCentrum from the local repo.
+#
+# Config resolution: ./.metacentrum.env (per project) > the per-user config
+# below > defaults. Keys: MC_USER MC_FRONTEND MC_HOME MC_STORAGE MC_PROJECT MC_REMOTE
+#
+#   ${XDG_CONFIG_HOME:-~/.config}/run-on-metacentrum/config.env
+#
+# `mc setup <user>` writes that file. MC_HOME is the storage your projects live
+# on (/storage/<name>/home/<user>); MC_STORAGE defaults to that storage's
+# server, storage-<name>.metacentrum.cz.
+#
+# Auth is Kerberos (GSSAPI). `kinit <user>@META` is interactive and must be run
+# by a human; every subcommand here fails fast with that instruction when the
+# ticket is missing or expired.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------- config ----
+
+MC_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/run-on-metacentrum"
+[ -f "$MC_CONFIG_DIR/config.env" ] && . "$MC_CONFIG_DIR/config.env"
+[ -f ./.metacentrum.env ] && . ./.metacentrum.env
+
+# perian/skirit hung on ssh 2026-10-09 (stalled storage mounts) while tarkil worked
+: "${MC_FRONTEND:=tarkil.grid.cesnet.cz}"
+: "${MC_USER:=}"
+if [ -n "$MC_USER" ]; then
+  : "${MC_HOME:=/storage/brno2/home/$MC_USER}"
+  if [ -z "${MC_STORAGE:-}" ]; then
+    _st="${MC_HOME#/storage/}"; MC_STORAGE="storage-${_st%%/*}.metacentrum.cz"
+  fi
+  : "${MC_PROJECT:=$(basename "$PWD")}"
+  : "${MC_REMOTE:=$MC_HOME/projects/$MC_PROJECT}"
+fi
+: "${MC_HOME:=}" "${MC_STORAGE:=}" "${MC_PROJECT:=}" "${MC_REMOTE:=}"
+
+CM_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/mc-ssh"
+mkdir -p "$CM_DIR" && chmod 700 "$CM_DIR"
+
+SSH_OPTS=(
+  -o BatchMode=yes
+  -o ControlMaster=auto
+  -o "ControlPath=$CM_DIR/%r@%h:%p"
+  -o ControlPersist=8h
+  -o ServerAliveInterval=30
+)
+
+need_user() {
+  [ -n "$MC_USER" ] || die "no MetaCentrum user configured. Run: mc setup <username>"
+}
+
+HOST="$MC_USER@$MC_FRONTEND"
+STORE="$MC_USER@$MC_STORAGE"
+# The storage server sees the same home as /home/<user>, not /storage/<name>/home/<user>:
+# a /storage path given to it does not exist there.
+on_store() { case "$1" in /storage/*/home/*) echo "/home/${1#/storage/*/home/}" ;; *) echo "$1" ;; esac; }
+
+# `module` is a shell function from this one profile snippet. Sourcing it beats
+# `bash -lc`, which also prints the MOTD (quota table, ASCII art, fortune) into
+# whatever you were trying to parse.
+MODINIT='. /etc/profile.d/30_meta_modules.sh 2>/dev/null || true'
+
+die() { printf 'mc: %s\n' "$*" >&2; exit 1; }
+
+need_ticket() {
+  need_user
+  command -v klist >/dev/null || die "klist not found; install krb5-workstation"
+  klist -s 2>/dev/null || die "no Kerberos ticket. Run this yourself:
+
+    kinit $MC_USER@META
+
+(tickets last 10 hours; every mc subcommand needs one)"
+}
+
+rssh()  { need_ticket; ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
+rssht() { need_ticket; ssh -t "${SSH_OPTS[@]}" "$HOST" "$@"; }   # with a tty, for tail -f
+
+# ------------------------------------------------------------ subcommands ----
+
+cmd_auth() {
+  need_ticket
+  klist | sed -n '1,6p'
+  rssh 'hostname; echo "home: $(cd ~ && pwd)"'
+}
+
+cmd_disconnect() {
+  ssh "${SSH_OPTS[@]}" -O exit "$HOST" 2>/dev/null || true
+  echo "control socket closed"
+}
+
+# mc sh '<command>'   -- runs on the frontend with `module` available
+cmd_sh() {
+  [ $# -ge 1 ] || die "usage: mc sh '<command>'"
+  rssh "$MODINIT; $*"
+}
+
+# mc env-sh '<command>' -- as above, plus the project's uv venv activated
+cmd_env_sh() {
+  [ $# -ge 1 ] || die "usage: mc env-sh '<command>'"
+  rssh "$MODINIT
+module add mambaforge >/dev/null 2>&1
+source activate $MC_HOME/mamba_base >/dev/null 2>&1 || true
+cd '$MC_REMOTE' || exit 1
+[ -f ${MC_VENV:-.venv}/bin/activate ] && . ${MC_VENV:-.venv}/bin/activate
+$*"
+}
+
+# mc push [--delete] [extra rsync args]
+# Honours .gitignore, so runs/ results/ *.pt on the remote are protected from
+# --delete (rsync never deletes receiver files matched by an exclude rule).
+cmd_push() {
+  need_ticket
+  local extra=()
+  [ -f .gitignore ] && extra+=(--filter=':- .gitignore')
+  # straight to the storage server: frontends' /storage mounts stall at times, and
+  # '.venv' without a slash also excludes a .venv that is a symlink
+  rsync -az --mkpath --info=stats1 \
+    -e "ssh ${SSH_OPTS[*]}" \
+    --exclude '.git' --exclude '.venv' --exclude '__pycache__' \
+    "${extra[@]}" "$@" \
+    ./ "$STORE:$(on_store "$MC_REMOTE")/"
+  echo "pushed → $MC_REMOTE"
+}
+
+# mc pull [dir ...]   -- default results; straight from the storage server
+cmd_pull() {
+  need_ticket
+  local dirs=("$@")
+  [ ${#dirs[@]} -eq 0 ] && dirs=(results)
+  for d in "${dirs[@]}"; do
+    mkdir -p "./$d"
+    rsync -azP -e "ssh ${SSH_OPTS[*]}" \
+      "$STORE:$(on_store "$MC_REMOTE")/$d/" "./$d/"
+    echo "pulled $d"
+  done
+}
+
+# mc submit <local-or-remote script> [qsub args ...]
+cmd_submit() {
+  [ $# -ge 1 ] || die "usage: mc submit <script.pbs.sh> [qsub args...]"
+  need_ticket
+  local script="$1"; shift
+  local base; base="$(basename "$script")"
+  if [ -f "$script" ]; then
+    rsync -az --mkpath -e "ssh ${SSH_OPTS[*]}" "$script" "$STORE:$(on_store "$MC_REMOTE")/jobs/$base"
+    rsync -az --mkpath -e "ssh ${SSH_OPTS[*]}" /dev/null "$STORE:$(on_store "$MC_REMOTE")/logs/.keep" 2>/dev/null || true
+  fi
+  echo "submitting $base from $MC_REMOTE"
+  # the first touch of /storage on a frontend can stall for minutes: time out
+  # rather than hang, and check `mc status` before retrying so nothing is queued twice
+  rssh "cd '$MC_REMOTE' && timeout 300 qsub $* 'jobs/$base'"
+}
+
+cmd_status() { need_ticket; rssh "qstat -u $MC_USER; echo; qstat -tu $MC_USER 2>/dev/null | tail -n +6 | head -40"; }
+
+cmd_queues() { need_ticket; rssh 'qstat -q'; }
+
+cmd_cancel() {
+  [ $# -ge 1 ] || die "usage: mc cancel <jobid>"
+  need_ticket
+  rssh "qdel $*"
+}
+
+cmd_extend() {
+  [ $# -eq 2 ] || die "usage: mc extend <jobid> <hh:mm:ss>"
+  need_ticket
+  rssh "$MODINIT; qextend $1 $2; qextend info"
+}
+
+cmd_info() {
+  [ $# -ge 1 ] || die "usage: mc info <jobid>"
+  need_ticket
+  rssh "qstat -xf '$1' 2>/dev/null | grep -E 'Job_Name|job_state|queue =|exec_host2|Exit_status|resources_used|Resource_List|array_state_count|comment' || qstat -f '$1'"
+  cat <<'EOF'
+
+exit status: -23 kerberos | -25 over ncpus | -27 over mem | -29 over walltime | 271 qdel | 0 ok
+EOF
+}
+
+# mc log <jobid> -- finished job's .o/.e from the project dir
+cmd_log() {
+  [ $# -ge 1 ] || die "usage: mc log <jobid>"
+  need_ticket
+  local n="${1%%.*}"
+  rssh "cd '$MC_REMOTE' 2>/dev/null || cd ~
+found=0
+for f in *.[oe]$n *.[oe]$n.* logs/*$n*; do
+  [ -f \"\$f\" ] || continue
+  found=1; echo \"===== \$f\"; tail -n 200 \"\$f\"
+done
+[ \$found -eq 1 ] || echo 'no .o/.e in $MC_REMOTE — job may still be running (mc tail $1), or output went elsewhere via -o/-e'"
+}
+
+# mc tail <jobid> -- follow a RUNNING job's stdout on its exec node
+cmd_tail() {
+  [ $# -ge 1 ] || die "usage: mc tail <jobid>"
+  need_ticket
+  local jid="$1"
+  case "$jid" in *.*) ;; *) jid="$jid.pbs-m1.metacentrum.cz";; esac
+  local node
+  node="$(rssh "qstat -f '$jid' 2>/dev/null | tr -d ' \n' | grep -o 'exec_host2=[^+]*' | head -1 | cut -d= -f2 | cut -d: -f1")"
+  [ -n "$node" ] || die "job $jid is not running (no exec_host2). Try: mc log $jid"
+  echo "--- $jid on $node (ctrl-c to stop) ---"
+  rssht "ssh -o StrictHostKeyChecking=no '$node' 'tail -n 100 -f /var/spool/pbs/spool/$jid.OU'"
+}
+
+cmd_scratch() {
+  [ $# -ge 1 ] || die "usage: mc scratch <jobid>"
+  need_ticket
+  rssh "$MODINIT; go_to_scratch ${1%%.*} || true; ls -la /scratch/$MC_USER/ | tail -20"
+}
+
+cmd_quota() { need_ticket; rssh "$MODINIT; check-local-quota 2>/dev/null; du -sh $MC_REMOTE 2>/dev/null"; }
+
+# mc setup <user> [/storage/<name>/home/<user>]
+cmd_setup() {
+  [ $# -ge 1 ] || die "usage: mc setup <username> [home, default /storage/brno2/home/<username>]"
+  local user="$1" home="${2:-/storage/brno2/home/$1}"
+  mkdir -p "$MC_CONFIG_DIR"
+  if [ -f "$MC_CONFIG_DIR/config.env" ]; then
+    die "$MC_CONFIG_DIR/config.env exists; edit it instead"
+  fi
+  cat > "$MC_CONFIG_DIR/config.env" <<EOF
+# run-on-metacentrum: per-user settings, sourced by mc. Per-project overrides go in
+# .metacentrum.env at the repo root.
+MC_USER=$user
+MC_HOME=$home
+MC_FRONTEND=$MC_FRONTEND
+EOF
+  [ -f "$MC_CONFIG_DIR/notes.md" ] || cat > "$MC_CONFIG_DIR/notes.md" <<'EOF'
+# MetaCentrum: personal notes
+
+Read by the run-on-metacentrum skill before it starts. Keep here what is true
+for this account only: existing environments, which frontend works, quirks of
+your own projects, accounts (W&B entity, HF), local paths.
+EOF
+  echo "wrote $MC_CONFIG_DIR/config.env and notes.md"
+  echo "next: kinit $user@META, then mc auth"
+}
+
+cmd_config() {
+  cat <<EOF
+config       $MC_CONFIG_DIR/config.env $( [ -f "$MC_CONFIG_DIR/config.env" ] || echo '(missing: mc setup <user>)')
+notes        $MC_CONFIG_DIR/notes.md $( [ -f "$MC_CONFIG_DIR/notes.md" ] || echo '(none)')
+MC_USER      $MC_USER
+MC_FRONTEND  $MC_FRONTEND
+MC_STORAGE   $MC_STORAGE
+MC_HOME      $MC_HOME
+MC_PROJECT   $MC_PROJECT
+MC_REMOTE    $MC_REMOTE
+EOF
+}
+
+usage() {
+  cat <<'EOF'
+mc <command> [args]
+
+  setup <user> [home]      write the per-user config (~/.config/run-on-metacentrum/)
+  auth                     check the Kerberos ticket and reach the frontend
+  config                   print resolved settings
+  sh '<cmd>'               run on the frontend (modules available)
+  env-sh '<cmd>'           run in the project dir with the uv venv activated
+  push [--delete] [...]    rsync repo up (respects .gitignore)
+  pull [dir ...]           rsync dirs down from the storage server (default: results)
+  submit <script> [qsub…]  copy the script up and qsub it from the project dir
+  status                   qstat -u (plus array subjobs)
+  queues                   qstat -q
+  info <jobid>             full job record + exit-status legend
+  log <jobid>              .o/.e of a finished job
+  tail <jobid>             follow a running job's stdout on its exec node
+  cancel <jobid>           qdel
+  extend <jobid> hh:mm:ss  qextend (running jobs only, not arrays)
+  scratch <jobid>          locate leftover scratch after a crash
+  quota                    root-fs quota on the node + project disk use
+  disconnect               close the ssh control socket
+EOF
+}
+
+# -------------------------------------------------------------- dispatch ----
+
+case "${1:-}" in
+  setup)      shift; cmd_setup "$@" ;;
+  auth)       shift; cmd_auth "$@" ;;
+  config)     shift; cmd_config "$@" ;;
+  sh)         shift; cmd_sh "$@" ;;
+  env-sh)     shift; cmd_env_sh "$@" ;;
+  push)       shift; cmd_push "$@" ;;
+  pull)       shift; cmd_pull "$@" ;;
+  submit)     shift; cmd_submit "$@" ;;
+  status|st)  shift; cmd_status "$@" ;;
+  queues)     shift; cmd_queues "$@" ;;
+  info)       shift; cmd_info "$@" ;;
+  log)        shift; cmd_log "$@" ;;
+  tail)       shift; cmd_tail "$@" ;;
+  cancel|del) shift; cmd_cancel "$@" ;;
+  extend)     shift; cmd_extend "$@" ;;
+  scratch)    shift; cmd_scratch "$@" ;;
+  quota)      shift; cmd_quota "$@" ;;
+  disconnect) shift; cmd_disconnect "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command '${1}'. Try: mc help" ;;
+esac
