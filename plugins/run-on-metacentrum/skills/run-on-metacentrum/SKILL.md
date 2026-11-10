@@ -72,6 +72,17 @@ Claude cannot type the password. When `klist -s` fails, stop and tell the user
 to run `! kinit <user>@META` in the terminal; then continue. Everything else
 in this skill runs unattended once a ticket exists.
 
+**First time on a Mac or new machine:** `kinit` fails until it knows the `META`
+realm. Copy the config from any frontend, which accepts password login.
+Do it as the user, then move it into place: `sudo scp` once got
+`Connection reset` before the password prompt, while plain `scp` worked.
+
+```bash
+scp <user>@tarkil.grid.cesnet.cz:/etc/krb5.conf ~/krb5.conf.meta
+sudo cp ~/krb5.conf.meta /etc/krb5.conf
+kinit -r 7d <user>@META        # renewable; kinit -R renews without a password
+```
+
 `scripts/mc` opens a **ControlMaster** socket (`ControlPersist=8h`) on first use,
 so the second and later commands are instant. Kill it with `mc disconnect`.
 
@@ -177,6 +188,13 @@ qsub -I -l select=1:ncpus=4:mem=16gb:scratch_local=20gb -l walltime=1:00:00
 `qsub -I` needs a terminal — hand it to the user with `! ssh ...` rather than
 trying to drive it. Short walltime also backfills better: a 2 h job starts far
 sooner than a 24 h one asking for the same cores.
+
+**For interactive GPU work, prefer the CERIT-SC JupyterHub** over `qsub -I`
+with `ngpus`: it has no queue and no walltime, and with the SSH image it works
+like a remote workstation (`ssh metahub`, VS Code Remote-SSH). It is
+IPv6-only, so SSH hops through a frontend. Setup, the idle rule, and how a MIG
+slice compares to a desktop GPU: `reference/interactive-gpu.md`.
+`scripts/hub-up` checks it is reachable.
 
 For a pure "does the environment import" check, the frontend itself is allowed
 — `mc env-sh 'python -c "import torch, gymnasium"'` is exactly the light
@@ -475,7 +493,9 @@ which is why `qsub -I` starts in seconds.
 
 - `reference/pbs.md` — resource flags, queues, arrays, exit codes, qstat/qalter/qextend, scratch types.
 - `reference/environments.md` — mamba + uv, containers, and the MuJoCo / torch / Minari specifics for ML repos.
+- `reference/interactive-gpu.md` — a queue-free GPU box on the CERIT-SC JupyterHub: spawn settings, SSH via a frontend, idle rule, MIG vs desktop GPU.
 - `scripts/pbs-local` — run a PBS script here, with a fake PBS around it.
+- `scripts/hub-up` — check the JupyterHub GPU box is reachable (kinit if needed, open the hub if it is gone).
 - `templates/` — `bootstrap.pbs.sh`, `single.pbs.sh`, `array.pbs.sh`, and
   `scratch-runtime/` (the ssh-only, self-contained runtime for big stacks and GPU jobs).
 - Docs root: <https://docs.metacentrum.cz/en/docs/welcome>. Qsub assembler
