@@ -9,6 +9,8 @@ results back. Everything in it was learned the hard way on real jobs.
   storage server, `qsub`/`qstat`/`qextend`, logs and live tails.
 - `scripts/pbs-local` — runs a PBS script on your own machine inside a fake PBS,
   including the walltime kill, so a broken job fails in seconds, not after hours in the queue.
+- `scripts/hub-up` + `reference/interactive-gpu.md` — a queue-free interactive GPU
+  box on the CERIT-SC JupyterHub, reached as `ssh metahub` through a frontend.
 - `templates/` — single run, array sweep, environment bootstrap, and a
   self-contained scratch runtime for torch/vLLM GPU jobs.
 - Notes on queues, fairshare, GPUs, scratch, storage and the usual exit codes.

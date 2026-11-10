@@ -1,0 +1,31 @@
+#!/bin/sh
+# hub-up: check that the CERIT-SC JupyterHub GPU box is reachable over ssh.
+# See reference/interactive-gpu.md for the one-time setup.
+#
+# Settings (environment, or HUB_* lines in run-on-metacentrum/config.env):
+#   HUB_SSH_HOST  ssh alias of the box (default: metahub)
+#   MC_USER       MetaCentrum login, for kinit
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/run-on-metacentrum/config.env"
+[ -f "$CONFIG" ] && . "$CONFIG"
+: "${HUB_SSH_HOST:=metahub}"
+HUB_URL="https://hub.cloud.e-infra.cz/hub/home"
+
+if ! klist -s 2>/dev/null; then
+  [ -n "$MC_USER" ] || { echo "No Kerberos ticket and MC_USER unset (mc setup <user>)." >&2; exit 1; }
+  echo "No valid Kerberos ticket. Running kinit (asks for your MetaCentrum password)..."
+  kinit -r 7d "$MC_USER@META" || exit 1
+fi
+
+if ssh -o BatchMode=yes -o ConnectTimeout=20 "$HUB_SSH_HOST" 'nvidia-smi -L' 2>/dev/null; then
+  echo "$HUB_SSH_HOST is up: ssh $HUB_SSH_HOST"
+  exit 0
+fi
+
+cat <<EOF
+$HUB_SSH_HOST is not reachable. The server is probably stopped, or was deleted for idling.
+Start it at $HUB_URL with the same server name and "Existing" home
+(settings: reference/interactive-gpu.md, "Spawning the server"), then run hub-up again.
+If ssh then complains about a changed host key: ssh-keygen -R <the HostName of $HUB_SSH_HOST>
+EOF
+command -v open >/dev/null 2>&1 && open "$HUB_URL" 2>/dev/null
+exit 1
